@@ -13,7 +13,6 @@
 char *p, *lp, // current position in source code
      *data,   // data/bss pointer
      *data_org; // start of data segment
-char *op_code;
 
 int *e, *le,  // current position in emitted code
     *e_base,  // start of code segment
@@ -27,6 +26,7 @@ int *e, *le,  // current position in emitted code
     src,      // print source and assembly flag
     debug,    // print executed instructions (non-interactive)
     trace;    // interactive trace/debug mode
+char *op_code, *tk_code, *ty_code;
 
 // tokens and classes (operators last and in precedence order)
 enum {
@@ -107,6 +107,11 @@ char *src_buf = NULL;
 int *stk_lo = NULL;  // lowest valid stack address (malloc base)
 int *stk_hi = NULL;  // highest valid stack address (sp initial top)
 
+
+void prn_type(int ty) {
+  printf("%s%.*s", (ty % PTR) == CHAR ? "char" : "int",
+                      (int32_t)((ty - (ty % PTR))/PTR), "***");
+}
 // ---- lntab / fntab helpers ----
 
 void lntab_add(int *pc_addr, int ln)
@@ -523,17 +528,19 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
                     w->var_type    = dl->var_type;
                     w->fn_entry_pc = fn_entry;
                     watch_cnt++;
-                    printf("  Watch added (local): %s  bp[%lld]  type=%s\n",
-                           wname, (int)dl->frame_off,
-                           dl->var_type == CHAR ? "char" :
-                           dl->var_type == INT  ? "int"  : "ptr");
+                    printf("  Watch added (local): %s  bp[%lld]  type=",
+                           wname, (int)dl->frame_off);
+                    prn_type(dl->var_type);
+                    printf("\n");
                 } else {
                     // Try global before cross-function locals
                     int *se = find_sym_by_name(wname);
                     if (se && se[Class] == Glo) {
                         w->sym_entry = se;
                         watch_cnt++;
-                        printf("  Watch added (global): %s\n", wname);
+                        printf("  Watch added (global): %s  type=", wname);
+                        prn_type(se[Type]);
+                        printf("\n");
                     } else {
                         // Last resort: search all functions for this local name
                         int ki;
@@ -574,25 +581,136 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
         }
         else if (buf[0] == 'w' && buf[1] == 'l' && buf[2] == 0) {
             int i;
-            int *cur_fn2 = fntab_lookup_pc(pc - 1);
-            int cur_fn_pc2 = cur_fn2 ? (int)cur_fn2 : 0;
             printf("  Watches:\n");
+
+            // Build frame stack same as show_watches() so addr/type are correct
+            int  wl_frame_fn[MAX_FRAMES];
+            int *wl_frame_bp[MAX_FRAMES];
+            int  wl_frame_cnt = 0;
+            int  wl_ins = cur_ins;  // cur_ins == *(pc-1), already decoded
+
+            if (wl_ins == ENT) {
+                int *ret_pc2   = (int *)sp[0];
+                int *caller_fn = fntab_lookup_pc(ret_pc2);
+                wl_frame_bp[wl_frame_cnt] = bp;
+                wl_frame_fn[wl_frame_cnt] = caller_fn ? (int)caller_fn : 0;
+                wl_frame_cnt++;
+                int *walk = VALID_BP((int *)bp[0], bp) ? (int *)bp[0] : NULL;
+                int *wret = (int *)bp[1];
+                while (walk && wl_frame_cnt < MAX_FRAMES) {
+                    int *wfn = fntab_lookup_pc(wret);
+                    wl_frame_bp[wl_frame_cnt] = walk;
+                    wl_frame_fn[wl_frame_cnt] = wfn ? (int)wfn : 0;
+                    wl_frame_cnt++;
+                    wret = (int *)walk[1];
+                    int *next = (int *)walk[0];
+                    walk = VALID_BP(next, walk) ? next : NULL;
+                }
+            } else if (wl_ins == LEV) {
+                int *cur_fn2 = fntab_lookup_pc(pc - 1);
+                wl_frame_bp[wl_frame_cnt] = bp;
+                wl_frame_fn[wl_frame_cnt] = cur_fn2 ? (int)cur_fn2 : 0;
+                wl_frame_cnt++;
+                int *caller_bp = VALID_BP((int *)bp[0], bp) ? (int *)bp[0] : NULL;
+                int *ret_pc2   = (int *)bp[1];
+                if (caller_bp) {
+                    int *caller_fn = fntab_lookup_pc(ret_pc2);
+                    wl_frame_bp[wl_frame_cnt] = caller_bp;
+                    wl_frame_fn[wl_frame_cnt] = caller_fn ? (int)caller_fn : 0;
+                    wl_frame_cnt++;
+                    int *walk = VALID_BP((int *)caller_bp[0], caller_bp) ? (int *)caller_bp[0] : NULL;
+                    int *wret  = (int *)caller_bp[1];
+                    while (walk && wl_frame_cnt < MAX_FRAMES) {
+                        int *wfn = fntab_lookup_pc(wret);
+                        wl_frame_bp[wl_frame_cnt] = walk;
+                        wl_frame_fn[wl_frame_cnt] = wfn ? (int)wfn : 0;
+                        wl_frame_cnt++;
+                        wret = (int *)walk[1];
+                        int *next = (int *)walk[0];
+                        walk = VALID_BP(next, walk) ? next : NULL;
+                    }
+                }
+            } else {
+                int *cur_fn2 = fntab_lookup_pc(pc - 1);
+                wl_frame_bp[wl_frame_cnt] = bp;
+                wl_frame_fn[wl_frame_cnt] = cur_fn2 ? (int)cur_fn2 : 0;
+                wl_frame_cnt++;
+                int *walk = VALID_BP((int *)bp[0], bp) ? (int *)bp[0] : NULL;
+                int *wret  = (int *)bp[1];
+                while (walk && wl_frame_cnt < MAX_FRAMES) {
+                    int *wfn = fntab_lookup_pc(wret);
+                    wl_frame_bp[wl_frame_cnt] = walk;
+                    wl_frame_fn[wl_frame_cnt] = wfn ? (int)wfn : 0;
+                    wl_frame_cnt++;
+                    wret = (int *)walk[1];
+                    int *next = (int *)walk[0];
+                    walk = VALID_BP(next, walk) ? next : NULL;
+                }
+            }
+
             for (i = 0; i < watch_cnt; i++) {
                 Watch *w = &watchlist[i];
                 if (w->is_local) {
-                    if (w->fn_entry_pc == cur_fn_pc2) {
-                        int *addr = bp + w->frame_off;
-                        int val = (w->var_type == CHAR) ? (int)*(char *)addr
-                                                               : *(int *)addr;
-                        printf("    [%lld] %s = %lld  (local bp[%lld])\n",
-                               (int)i, w->name, val, (int)w->frame_off);
-                    } else {
-                        printf("    [%lld] %s = <out-of-scope>  (local bp[%lld])\n",
-                               (int)i, w->name, (int)w->frame_off);
+                    // Find home frame
+                    int home_j = -1, j;
+                    for (j = 0; j < wl_frame_cnt; j++) {
+                        if (wl_frame_fn[j] == w->fn_entry_pc) { home_j = j; break; }
+                    }
+                    if (home_j < 0) {
+                        printf("    [%lld] %s = <out-of-scope>\n", (int)i, w->name);
+                        continue;
+                    }
+                    // Check inner frames for shadowing
+                    int found = 0;
+                    for (j = 0; j < home_j; j++) {
+                        if (!wl_frame_bp[j]) continue;
+                        DbgLocal *dl = find_dbg_local(w->name, wl_frame_fn[j]);
+                        if (dl) {
+                            int *addr = wl_frame_bp[j] + dl->frame_off;
+                            int val = (dl->var_type == CHAR) ? (int)*(char *)addr : *(int *)addr;
+                            printf("    [%lld] %s = %lld  (local bp[%lld] type=",
+                                   (int)i, w->name, val, (int)dl->frame_off);
+                            prn_type(dl->var_type);
+                            printf(")\n");
+                            found = 1; break;
+                        }
+                    }
+                    if (!found) {
+                        DbgLocal *dl = find_dbg_local(w->name, w->fn_entry_pc);
+                        if (dl && wl_frame_bp[home_j]) {
+                            int *addr = wl_frame_bp[home_j] + dl->frame_off;
+                            int val = (dl->var_type == CHAR) ? (int)*(char *)addr : *(int *)addr;
+                            printf("    [%lld] %s = %lld  (local bp[%lld] type=",
+                                   (int)i, w->name, val, (int)dl->frame_off);
+                            prn_type(dl->var_type);
+                            printf(")\n");
+                        } else {
+                            printf("    [%lld] %s = ?\n", (int)i, w->name);
+                        }
                     }
                 } else if (w->sym_entry && w->sym_entry[Class] == Glo) {
-                    int val = *(int *)w->sym_entry[Val];
-                    printf("    [%lld] %s = %lld  (global)\n", (int)i, w->name, val);
+                    // Check if any local shadows the global
+                    int found = 0, j;
+                    for (j = 0; j < wl_frame_cnt; j++) {
+                        if (!wl_frame_bp[j]) continue;
+                        DbgLocal *dl = find_dbg_local(w->name, wl_frame_fn[j]);
+                        if (dl) {
+                            int *addr = wl_frame_bp[j] + dl->frame_off;
+                            int val = (dl->var_type == CHAR) ? (int)*(char *)addr : *(int *)addr;
+                            printf("    [%lld] %s = %lld  (local-shadow bp[%lld] type=",
+                                   (int)i, w->name, val, (int)dl->frame_off);
+                            prn_type(dl->var_type);
+                            printf(")\n");
+                            found = 1; break;
+                        }
+                    }
+                    if (!found) {
+                        int val = *(int *)w->sym_entry[Val];
+                        printf("    [%lld] %s = %lld  (global addr=%lld type=",
+                               (int)i, w->name, val, (int)w->sym_entry[Val]);
+                        prn_type(w->sym_entry[Type]);
+                        printf(")\n");
+                    }
                 } else {
                     printf("    [%lld] %s = <unavailable>\n", (int)i, w->name);
                 }
@@ -608,15 +726,38 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
                 int *addr = bp + dl2->frame_off;
                 int val = (dl2->var_type == CHAR) ? (int)*(char *)addr
                                                          : *(int *)addr;
-                printf("  %s = %lld (%lld)  [local bp[%lld]]\n",
-                       pname, val, (int)val, (int)dl2->frame_off);
+                printf("  %s = %lld  (local bp[%lld] type=",
+                       pname, val, (int)dl2->frame_off);
+                prn_type(dl2->var_type); printf(")\n");
             } else {
                 int *se = find_sym_by_name(pname);
                 if (se && se[Class] == Glo) {
                     int val = *(int *)se[Val];
-                    printf("  %s = %lld (%lld)  [global]\n", pname, val, (int)val);
+                    printf("  %s = %lld  (global addr=%lld type=", pname, val, (int)se[Val]);
+                    prn_type(se[Type]);
+                    printf(")\n");
                 } else if (se && se[Class] == Num) {
                     printf("  %s = %lld  [enum/const]\n", pname, (int)se[Val]);
+                } else if (se) {
+                    // Function, syscall, or other symbol: show sym table fields
+                    char cls_str[16], tk_str[16];
+                    int64_t cls_v = se[Class], tk_v = se[Tk];
+                    if      (cls_v == Fun) strcpy(cls_str, "Fun");
+                    else if (cls_v == Sys) strcpy(cls_str, "Sys");
+                    else if (cls_v == Glo) strcpy(cls_str, "Glo");
+                    else if (cls_v == Loc) strcpy(cls_str, "Loc");
+                    else if (cls_v == Num) strcpy(cls_str, "Num");
+                    else sprintf(cls_str, "%lld", cls_v);
+                    if      (tk_v == Fun) strcpy(tk_str, "Fun");
+                    else if (tk_v == Sys) strcpy(tk_str, "Sys");
+                    else if (tk_v == Glo) strcpy(tk_str, "Glo");
+                    else if (tk_v == Loc) strcpy(tk_str, "Loc");
+                    else if (tk_v == Num) strcpy(tk_str, "Num");
+                    else if (tk_v == Id)  strcpy(tk_str, "Id");
+                    else sprintf(tk_str, "%lld", tk_v);
+                    printf("  %s: Tk=%s Class=%s Type=", pname, tk_str, cls_str);
+                    prn_type(se[Type]);
+                    printf(" Val=%lld\n", (int64_t)se[Val]);
                 } else {
                     printf("  Symbol '%s' not found\n", pname);
                 }
@@ -665,7 +806,7 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
                             sname[slen] = 0;
                         }
                         // Decode Tk, Class, Type
-                        char tk_str[16], cls_str[16], ty_str[16];
+                        char tk_str[16], cls_str[16];
                         int64_t tk_v = sid[Tk];
                         if      (tk_v == 128+ 0) strcpy(tk_str, "Num");
                         else if (tk_v == 128+ 1) strcpy(tk_str, "Fun");
@@ -683,15 +824,17 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
                         else if (cls_v == Num) strcpy(cls_str, "Num");
                         else sprintf(cls_str, "%lld", cls_v);
 
-                        int64_t ty_v = sid[Type];
-                        if      (ty_v == CHAR) strcpy(ty_str, "char");
-                        else if (ty_v == INT)  strcpy(ty_str, "int");
-                        else if (ty_v == PTR)  strcpy(ty_str, "ptr");
-                        else sprintf(ty_str, "ptr+%lld", ty_v - PTR);
+                        // int64_t ty_v = sid[Type];
+                        // if      (ty_v == CHAR) strcpy(ty_str, "char");
+                        // else if (ty_v == INT)  strcpy(ty_str, "int");
+                        // else if (ty_v == PTR)  strcpy(ty_str, "ptr");
+                        // else sprintf(ty_str, "ptr+%lld", ty_v - PTR);
 
-                        printf("  SYM[%lld]: Tk=%s Name=%s Class=%s Type=%s Val=%lld\n",
+                        printf("  SYM[%lld]: Tk=%s Name=%s Class=%s Val=%lld Type=",
                             (int64_t)(sid - sym) / Idsz, tk_str, sname,
-                            cls_str, ty_str, (int64_t)sid[Val]);
+                            cls_str, (int64_t)sid[Val]);
+                        prn_type(sid[Type]);
+                        printf("\n");
                         found = 1;
                         break;
                     }
@@ -730,7 +873,7 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
                             sname[slen] = 0;
                         }
                         // Decode Class and Type strings
-                        char cls_str[16], ty_str[16];
+                        char cls_str[16];
                         int64_t cls_v = sid[Class];
                         if      (cls_v == Fun) strcpy(cls_str, "Fun");
                         else if (cls_v == Sys) strcpy(cls_str, "Sys");
@@ -738,12 +881,14 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
                         else if (cls_v == Loc) strcpy(cls_str, "Loc");
                         else if (cls_v == Num) strcpy(cls_str, "Num");
                         else sprintf(cls_str, "%lld", cls_v);
-                        if      (ty_v == CHAR) strcpy(ty_str, "char");
-                        else if (ty_v == INT)  strcpy(ty_str, "int");
-                        else if (ty_v == PTR)  strcpy(ty_str, "ptr");
-                        else sprintf(ty_str, "ptr+%lld", ty_v - PTR);
-                        printf("  SYM: Tk=%lld Name=%s Class=%s Type=%s Val=%lld",
-                            (int64_t)sid[Tk], sname, cls_str, ty_str, (int64_t)sid[Val]);
+                        // if      (ty_v == CHAR) strcpy(ty_str, "char");
+                        // else if (ty_v == INT)  strcpy(ty_str, "int");
+                        // else if (ty_v == PTR)  strcpy(ty_str, "ptr");
+                        // else sprintf(ty_str, "ptr+%lld", ty_v - PTR);
+                        printf("  SYM: Tk=%lld Name=%s Class=%s Val=%lld Type=",
+                            (int64_t)sid[Tk], sname, cls_str, (int64_t)sid[Val]);
+                        prn_type(ty_v);
+                        printf("\n");
                         // For Glo: also show current value stored at Val
                         if (cls_v == Glo) {
                             int64_t gval = *(int64_t *)sid[Val];
@@ -1154,6 +1299,13 @@ int32_t main(int32_t argc, char **argv)
   op_code = "LEA ,IMM ,JMP ,JSR ,BZ  ,BNZ ,ENT ,ADJ ,LEV ,LI  ,LC  ,SI  ,SC  ,PSH ,"
             "OR  ,XOR ,AND ,EQ  ,NE  ,LT  ,GT  ,LE  ,GE  ,SHL ,SHR ,ADD ,SUB ,MUL ,DIV ,MOD ,"
             "OPEN,READ,CLOS,PRTF,MALC,FREE,MSET,MCMP,EXIT,";
+            
+  tk_code = "Num   ,Fun   ,Sys   ,Glo   ,Loc   ,Id    ,"
+            "Char  ,Else  ,Enum  ,If    ,Int   ,Return,Sizeof,While ,0"
+            "Assign,Cond  ,Lor   ,Lan   ,Or    ,Xor   ,And   ,Eq    ,0Ne    ,Lt    ,Gt    ,Le    ,Ge    ,"
+            "Shl   ,Shr   ,Add   ,Sub   ,Mul   ,Div   ,Mod   ,Inc   ,0Dec   ,Brak  ,";
+
+  ty_code = "CHAR\0INT \0PTR \0";
 
   line = 1;
   next();
@@ -1371,10 +1523,10 @@ int32_t main(int32_t argc, char **argv)
     else if (i == ENT) { *--sp = (int)bp; bp = sp; sp = sp - *pc++; }
     else if (i == ADJ) sp = sp + *pc++;
     else if (i == LEV) { sp = bp; bp = (int *)*sp++; pc = (int *)*sp++; }
-    else if (i == LI)  a = *(int *)a;
-    else if (i == LC)  a = *(char *)a;
-    else if (i == SI)  *(int *)*sp++ = a;
-    else if (i == SC)  a = *(char *)*sp++ = a;
+    else if (i == LI)  { if (!a) { printf("null pointer dereference (LI) cycle=%lld\n", cycle); return -1; } a = *(int *)a; }
+    else if (i == LC)  { if (!a) { printf("null pointer dereference (LC) cycle=%lld\n", cycle); return -1; } a = *(char *)a; }
+    else if (i == SI)  { if (!*sp) { printf("null pointer dereference (SI) cycle=%lld\n", cycle); return -1; } *(int *)*sp++ = a; }
+    else if (i == SC)  { if (!*sp) { printf("null pointer dereference (SC) cycle=%lld\n", cycle); return -1; } a = *(char *)*sp++ = a; }
     else if (i == PSH) *--sp = a;
     else if (i == OR)  a = *sp++ |  a;
     else if (i == XOR) a = *sp++ ^  a;
