@@ -66,10 +66,18 @@ When running with `-t`, execution pauses at each new source line and shows a `(d
 | `p name` | Print the current value of a variable (searches local scope first, then global, then enum/const) |
 
 ```
+(deb) > p main
+  main : Tk=Id Class=Fun Type=char Val=35005923456
+(deb) > p printf
+  printf : Tk=Id Class=Sys Type=int Val=33
+(deb) > p if
+  if : Tk=137 Class=0 Type=char Val=0
 (deb) > p x
-  x = 42 (42)  [local bp[-1]]
+  x : Tk=Id Class=Loc Type=int Val=2
+     -> 42  (local type=int val=bp[-1])
 (deb) > p buf
-  buf = 140732001234 (140732001234)  [global]
+  buf : Tk=Id Class=Glo Type=char* Val=140733234688
+     -> "hello"  (global type=char* val=[140733234688])
 (deb) > p MY_CONST
   MY_CONST = 7  [enum/const]
 ```
@@ -82,17 +90,17 @@ Watches are evaluated and printed automatically at every pause in the `WCH:` lin
 |---------|-------------|
 | `w name` | Add variable to the watch list (local scope → global → any function's local) |
 | `wd N` | Delete watch at index N |
-| `wl` | List all watches with their current values |
+| `wl` | List all watches by index and name |
 
 ```
 (deb) > w x
-  Watch added (local): x  bp[-1]  type=int
+  Watch added x
 (deb) > w buf
-  Watch added (global): buf
+  Watch added buf
 (deb) > wl
   Watches:
-    [0] x = 42  (local bp[-1])
-    [1] buf = 140732001234  (global)
+    [0] x
+    [1] buf
 (deb) > wd 0
   Watch 0 deleted
 ```
@@ -107,11 +115,17 @@ Watches are evaluated and printed automatically at every pause in the `WCH:` lin
 (deb) > r
   REG: a=42  sp=140731998800  bp=140731998840  pc=140731234568
   Stack:
-    140731998800:[-5] = 140731998824
-    140731998808:[-4] = 6158577176
-    ...
-    140731998840:[ 0]B= 0         ← B marks bp
+    140731998800:[-5]  = 140731998824
+    140731998808:[-4]  = 6158577176
+    140731998816:[-3]  = 0
+    140731998824:[-2]  = 140731234520
+    140731998832:[-1]  = 140731998856
+    140731998840:[ 0]B = 0
+    140731998848:[ 1]  = 140731234530
+    140731998856:[ 2]  = 3
 ```
+
+(`B` marks the current frame pointer `bp`.)
 
 ### Source view
 
@@ -131,25 +145,22 @@ Watches are evaluated and printed automatically at every pause in the `WCH:` lin
 
 `i nnn` takes a numeric address (decimal or `0x` hex) and identifies which memory segment it belongs to, then prints the relevant information.
 
-```
-(deb) > i nnn
-```
-
 | Segment matched | Output |
 |-----------------|--------|
-| **Symbol table** (`sym` array) | `SYM[idx]: Tk=... Name=... Class=... Type=... Val=...` |
+| **Symbol table** (`sym` array) | `SYM[idx]: Tk=Name Name="..." Class=Name Val=... Type=...` |
 | **Code segment** (emitted bytecode) | `CODE[nnn]: OPNAME [operand]` |
-| **Data segment** (global/static data) | `SYM: Tk=... Name=... Class=... Type=... Val=...  -> current_value` |
+| **Data segment** (global/static data) | `SYM: Tk=N Name="..." Class=Name Val=... Type=...  -> current_value` |
 | **Stack** | `STK[nnn]: value  (offset from sp: ...  from bp: ...)` |
 | **None of the above** (treated as source line number) | `SRC[nnn]: source text` |
 
 #### Symbol table entry (`sym` range)
 
-Displays the full sym entry for whichever identifier occupies that address:
+Displays the full sym entry for whichever identifier occupies that address.
+`Tk` and `Class` are printed as token/class names (e.g. `Fun`, `Glo`, `Loc`):
 
 ```
 (deb) > i 42488561680
-  SYM[3]: Tk=133 Name=buf Class=Glo Type=ptr Val=42488348160
+  SYM[3]: Tk=Id Name="buf" Class=Glo Val=42488348168 Type=char*
 ```
 
 #### Code segment (`e` range)
@@ -158,18 +169,25 @@ Shows the opcode (and operand if applicable) at that bytecode address:
 
 ```
 (deb) > i 42488561680
-  CODE[42488561680]: IMM  42488348160
+  CODE[42488561680]: IMM 42488348168
+(deb) > i 42488561688
+  CODE[42488561688]: PSH
 ```
 
 #### Data segment — global variable (`data` range)
 
-When the address matches a global variable's storage location (`sym[Val]`), the sym entry is shown together with the variable's current value.
-For integer globals the value is shown as a number; for pointer/char globals the pointed-to string is shown with escape sequences so control characters never corrupt the terminal:
+When the address matches a global variable's storage location (`sym[Val]`), the sym entry is shown with `Tk` as a raw number, followed by the current value.
+For integer globals the value is shown as a number; for `char*` globals the address and pointed-to string (with escape sequences) are shown:
 
 ```
 (deb) > i 42488348160
-  SYM: Tk=133 Name=x   Class=Glo Type=int Val=42488348160  -> 42
-  SYM: Tk=133 Name=buf Class=Glo Type=ptr Val=42488348168  -> 42488349200="hello, world\n"
+  SYM: Tk=133 Name="x" Class=Glo Val=42488348160 Type=int
+       [Val]=42
+(deb) > i 42488348168
+  SYM: Tk=133 Name="buf" Class=Glo Val=42488348168 Type=char*
+       [[Val]]=[42488349200]="hello, world\n"
+(deb) > i 42488349200
+  DATA[42488349200]: 7303014251067469672 or "hello, w"
 ```
 
 #### Stack (`sp`–`stk_hi` range)
@@ -190,7 +208,7 @@ If `nnn` does not match any memory segment, it is treated as a 1-based source li
 
 ## Automatic pause display
 
-Every time execution pauses, c4deb prints:
+Every time execution pauses (step, step-over, or breakpoint), c4deb prints:
 
 ```
 === [cycle=N] line=L in funcname() ===
@@ -198,12 +216,13 @@ Every time execution pauses, c4deb prints:
    OP: OPNAME [operand]
   REG: a=...  sp=...  bp=...  pc=...
   STK: val0 val1 val2 val3
-  WCH: varA=1  varB=42
+  WCH: varA=1  varB="hello"
 (deb) >
 ```
 
-The `WCH:` line only appears when there is at least one active watch.
-A `[Breakpoint at line N]` notice is printed when a breakpoint triggered the pause.
+- `STK:` shows the top 4 stack values; `B=` prefix marks the slot at `bp`.
+- `WCH:` only appears when there is at least one active watch. Integer values are printed as numbers; `char*` values are printed as quoted strings with escape sequences.
+- A `[Breakpoint at line N]` notice is printed when a breakpoint triggered the pause.
 
 ## VM instruction set
 
