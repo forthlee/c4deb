@@ -104,21 +104,47 @@ Watches are evaluated and printed automatically at every pause in the `WCH:` lin
 | Command | Description |
 |---------|-------------|
 | `w name` | Add variable to the watch list (local scope → global → any function's local) |
+| `w name[n]` | Watch `*(name+n)` — reads the pointer stored in `name`, dereferences at index `n`; displayed as a number or quoted string depending on the value |
 | `wd N` | Delete watch at index N |
-| `wl` | List all watches by index and name |
+| `wl` | List all watches by index and name (indexed watches shown as `name[n]`) |
 
 ```
 (deb) > w x
   Watch added x
-(deb) > w buf
-  Watch added buf
+(deb) > w id[0]
+  Watch added id
+(deb) > w id[1]
+  Watch added id
 (deb) > wl
   Watches:
     [0] x
-    [1] buf
+    [1] id[0]
+    [2] id[1]
 (deb) > wd 0
   Watch 0 deleted
 ```
+
+`w name[n]` is useful when debugging pointer-heavy code. For example, when tracing c4's lexer with `w id[1]`, `id` is a pointer into the symbol table and `id[1]` (`id[Hash]`) is shown at every pause:
+
+```
+  WCH: id[1]=10954826596
+```
+
+If `*(name+n)` falls inside the data segment, stack, or a heap allocation, it is displayed as a quoted string instead of a raw number.
+
+### Chaining commands
+
+Multiple commands can be entered on one line, separated by `,`. They are executed in order. Non-action commands (`w`, `b`, `p`, `wl`, `bl`, …) are all applied; the first action command (`s`, `n`, `c`, `q`) executes and ends the prompt.
+
+```
+(deb) > w id[0], w id[1], w id[3], n next
+  Watch added id
+  Watch added id
+  Watch added id
+  Function breakpoint 0 set on next()
+```
+
+Any sub-commands after an action command are discarded.
 
 ### Registers and stack
 
@@ -274,18 +300,16 @@ int main()
 ```
 
 At the first pause (c4's `main()` entry), set a watch on `pp` and a function breakpoint
-on `next` (c4's lexer), then continue:
+on `next` (c4's lexer) in one line, then continue:
 
 ```
 === [cycle=1] line=333 in main() ===
   333:  int main(int argc, char **argv)
    OP: ENT  12
   ...
-(deb) > w pp
+(deb) > w pp, n next, c
   Watch added pp
-(deb) > n next
   Function breakpoint 0 set on next()
-(deb) > c
   [Function breakpoint: will pause after next() returns]
 
 === [cycle=436] line=83 in next() ===
