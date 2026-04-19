@@ -96,10 +96,19 @@ int   watch_cnt = 0;
 int brkpt_lines[MAX_BRKPTS];
 int brkpt_cnt = 0;
 
+// function call breakpoints: pause after the named function returns
+int *fn_brkpt_pcs[MAX_BRKPTS];  // entry PC of each watched function
+char fn_brkpt_names[MAX_BRKPTS][64];
+int  fn_brkpt_cnt = 0;
+
 // debugger state
 int deb_last_line = -1;
 int deb_stepping  = 1;  // 1 = step mode, 0 = continue
 int deb_stepover  = 0;  // step-over depth counter
+
+// function-call breakpoint tracking (separate from step-over)
+int deb_fn_active = 0;  // waiting for a fn_brkpt call to return
+int deb_fn_depth  = 0;  // nested call depth inside that call
 
 // original source buffer pointer (for src_lines)
 char *src_buf = NULL;
@@ -107,6 +116,29 @@ char *src_buf = NULL;
 // stack bounds for safe bp-chain walking
 int *stk_lo = NULL;  // lowest valid stack address (malloc base)
 int *stk_hi = NULL;  // highest valid stack address (sp initial top)
+
+// heap tracking: record MALC allocations so ptr_in_safe_range can recognise them
+#define MAX_HEAP_REGIONS 1024
+typedef struct { char *base; int64_t size; } HeapRegion;
+static HeapRegion heap_regions[MAX_HEAP_REGIONS];
+static int        heap_region_cnt = 0;
+
+static void heap_track_add(char *base, int64_t size) {
+    if (heap_region_cnt < MAX_HEAP_REGIONS) {
+        heap_regions[heap_region_cnt].base = base;
+        heap_regions[heap_region_cnt].size = size;
+        heap_region_cnt++;
+    }
+}
+static void heap_track_remove(char *base) {
+    int i;
+    for (i = 0; i < heap_region_cnt; i++) {
+        if (heap_regions[i].base == base) {
+            heap_regions[i] = heap_regions[--heap_region_cnt];
+            return;
+        }
+    }
+}
 
 // Write at most maxlen escaped chars of s into out[]; return pointer past last byte.
 static char *escape_to_buf(char *out, const char *s, int32_t maxlen)
@@ -159,6 +191,12 @@ char* fmt_cls(int64_t cls_v)
 static int ptr_in_safe_range(char *p) {
     if (data_org && data && p >= data_org && p < data) return 1;
     if (stk_lo && stk_hi && p >= (char *)stk_lo && p < (char *)stk_hi) return 1;
+    // also accept heap regions allocated by the interpreted program via MALC
+    int i;
+    for (i = 0; i < heap_region_cnt; i++) {
+        if (p >= heap_regions[i].base &&
+            p <  heap_regions[i].base + heap_regions[i].size) return 1;
+    }
     return 0;
 }
 
@@ -502,6 +540,52 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
             deb_stepover = 1; // signal to VM loop
             handled = 1;
         }
+        else if (buf[0] == 'n' && buf[1] == ' ') {
+            // n <func>: break after func() returns
+            char *fname = buf + 2;
+            int flen = strlen(fname);
+            int found = 0, fi;
+            for (fi = 0; fi < fntab_cnt; fi++) {
+                int *fid = fntab_id[fi];
+                if (!fid) continue;
+                int nlen = fid[Hash] & 0x3F;
+                if (nlen == flen && !memcmp((char *)fid[Name], fname, flen)) {
+                    if (fn_brkpt_cnt < MAX_BRKPTS) {
+                        fn_brkpt_pcs[fn_brkpt_cnt] = fntab_pc[fi];
+                        strncpy(fn_brkpt_names[fn_brkpt_cnt], fname, 63);
+                        fn_brkpt_names[fn_brkpt_cnt][63] = 0;
+                        fn_brkpt_cnt++;
+                        printf("  Function breakpoint %lld set on %s()\n",
+                               (int)(fn_brkpt_cnt - 1), fname);
+                    } else {
+                        printf("  Function breakpoint table full\n");
+                    }
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) printf("  Function '%s' not found\n", fname);
+        }
+        else if (buf[0] == 'n' && buf[1] == 'f' && buf[2] == 'l' && buf[3] == 0) {
+            int fi;
+            printf("  Function breakpoints:\n");
+            for (fi = 0; fi < fn_brkpt_cnt; fi++)
+                printf("    [%lld] %s()\n", (int)fi, fn_brkpt_names[fi]);
+        }
+        else if (buf[0] == 'n' && buf[1] == 'f' && buf[2] == 'd' && buf[3] == ' ') {
+            int idx = atoi(buf + 4);
+            if (idx >= 0 && idx < fn_brkpt_cnt) {
+                int fi;
+                for (fi = idx; fi < fn_brkpt_cnt - 1; fi++) {
+                    fn_brkpt_pcs[fi] = fn_brkpt_pcs[fi + 1];
+                    memcpy(fn_brkpt_names[fi], fn_brkpt_names[fi + 1], 64);
+                }
+                fn_brkpt_cnt--;
+                printf("  Function breakpoint %lld deleted\n", (int)idx);
+            } else {
+                printf("  Invalid function breakpoint index\n");
+            }
+        }
         else if (buf[0] == 'c' && buf[1] == 0) {
             // continue
             deb_stepping = 0;
@@ -789,6 +873,7 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
         }
         else if (buf[0] != 0) {
             printf("  Commands: s/Enter=step  n=step-over  c=continue\n");
+            printf("            n <func>=break after func() returns  nfl=list  nfd N=delete\n");
             printf("            b N=break  bd N=del-break  bl=list-breaks\n");
             printf("            w name=watch  wd N=del-watch  wl=list-watches\n");
             printf("            p name=print  r=registers  src [N]=source  q=quit\n");
@@ -1277,6 +1362,34 @@ int32_t main(int32_t argc, char **argv)
     if (trace) {
       int cur_ln = lntab_lookup(pc - 1);
 
+      // Function-call breakpoint: independent depth tracking.
+      // When JSR to a watched function is seen, start tracking.
+      // depth counts nested JSR/LEV inside that call; foo's own LEV hits 0 → stop.
+      if (deb_fn_active) {
+        if (i == JSR) deb_fn_depth++;
+        else if (i == LEV) {
+          if (deb_fn_depth > 0) deb_fn_depth--;
+          else {
+            // foo() has returned — pause here (before LEV executes)
+            deb_stepping  = 1;
+            deb_fn_active = 0;
+          }
+        }
+      }
+      if (!deb_fn_active && i == JSR && fn_brkpt_cnt > 0) {
+        int *target = (int *)*pc;
+        int fi;
+        for (fi = 0; fi < fn_brkpt_cnt; fi++) {
+          if (fn_brkpt_pcs[fi] == target) {
+            deb_fn_active = 1;
+            deb_fn_depth  = 0;  // JSR itself is the entry; nested calls add depth
+            printf("  [Function breakpoint: will pause after %s() returns]\n",
+                   fn_brkpt_names[fi]);
+            break;
+          }
+        }
+      }
+
       // Handle step-over depth tracking
       if (deb_stepover) {
         if (i == JSR) deb_stepover_depth++;
@@ -1372,8 +1485,8 @@ int32_t main(int32_t argc, char **argv)
     else if (i == READ) a = read(sp[2], (char *)sp[1], *sp);
     else if (i == CLOS) a = close(*sp);
     else if (i == PRTF) { t = sp + pc[1]; a = printf((char *)t[-1], t[-2], t[-3], t[-4], t[-5], t[-6]); }
-    else if (i == MALC) a = (int)malloc(*sp);
-    else if (i == FREE) free((void *)*sp);
+    else if (i == MALC) { a = (int)malloc(*sp); if (a) heap_track_add((char *)a, *sp); }
+    else if (i == FREE) { heap_track_remove((char *)*sp); free((void *)*sp); }
     else if (i == MSET) a = (int)memset((char *)sp[2], sp[1], *sp);
     else if (i == MCMP) a = memcmp((char *)sp[2], (char *)sp[1], *sp);
     else if (i == EXIT) { printf("exit(%lld) cycle = %lld\n", *sp, cycle); return *sp; }
