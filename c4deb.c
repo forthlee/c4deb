@@ -88,6 +88,8 @@ typedef struct {
     int  frame_off;     // local: LEA offset from bp
     int  var_type;      // local: CHAR/INT/PTR
     int  fn_entry_pc;   // local: owning function entry pc (scope check)
+    int  is_indexed;    // 1: watch *(base+index), display as value or string
+    int  index;         // index n in name[n]
 } Watch;
 Watch watchlist[MAX_WATCHES];
 int   watch_cnt = 0;
@@ -210,9 +212,13 @@ char* fmt_val(int64_t gval, int ty_v) {
             out = escape_to_buf(out, (char *)gval, 64);
             *out++ = '"';
             *out   = '\0';
+        } else if (31 < gval && gval < 127) {
+            sprintf(_val, "%lld'%c'", gval, (char)gval); 
         } else {
-            sprintf(_val, "0x%llx", (unsigned long long)gval);
+            sprintf(_val, "%lld", gval);
         }
+    } else if (31 < gval && gval < 127) {
+        sprintf(_val, "%lld'%c'", gval, (char)gval);  
     } else {
         sprintf(_val, "%lld", gval);
     }
@@ -389,6 +395,18 @@ static int build_frame_stack(int *cur_pc, int cur_ins, int *bp, int *sp,
 
 // ---- watch helpers ----
 
+// Print a watch value; if is_indexed, dereference base as int* and show elem as value/string.
+#define PRINT_WATCH_VAL(w, val, ty) do { \
+    if ((w)->is_indexed) { \
+        int64_t *_ptr = (int64_t *)(int64_t)(val); \
+        int64_t _elem = _ptr ? _ptr[(w)->index] : 0; \
+        printf(" %s[%lld]=%s ", (w)->name, (int64_t)(w)->index, \
+               _ptr ? fmt_val(_elem, CHAR+PTR) : "null"); \
+    } else { \
+        printf(" %s=%s ", (w)->name, fmt_val((val), (ty))); \
+    } \
+} while(0)
+
 int *find_sym_by_name(char *name)
 {
     int len = strlen(name);
@@ -438,8 +456,8 @@ void show_watches(int *bp, int *sp, int *cur_pc)
                     DbgLocal *dl = find_dbg_local(w->name, frame_fn[j]);
                     if (dl) {
                         int *addr = frame_bp[j] + dl->frame_off;
-                        int val = (dl->var_type == CHAR) ? (int)*(char *)addr : *(int *)addr;                      
-                        printf(" %s=%s ", w->name, fmt_val(val, dl->var_type));
+                        int val = (dl->var_type == CHAR) ? (int)*(char *)addr : *(int *)addr;
+                        PRINT_WATCH_VAL(w, val, dl->var_type);
                         found = 1;
                         break;
                     }
@@ -450,7 +468,7 @@ void show_watches(int *bp, int *sp, int *cur_pc)
                     if (dl && frame_bp[home_j]) {
                         int *addr = frame_bp[home_j] + dl->frame_off;
                         int val = (dl->var_type == CHAR) ? (int)*(char *)addr : *(int *)addr;
-                        printf(" %s=%s ", w->name, fmt_val(val, dl->var_type));
+                        PRINT_WATCH_VAL(w, val, dl->var_type);
                     } else {
                         printf(" %s=? ", w->name);
                     }
@@ -465,14 +483,14 @@ void show_watches(int *bp, int *sp, int *cur_pc)
                 if (dl) {
                     int *addr = frame_bp[j] + dl->frame_off;
                     int val = *addr;
-                    printf(" %s=%s ", w->name, fmt_val(val, dl->var_type));
+                    PRINT_WATCH_VAL(w, val, dl->var_type);
                     is_loc = 1;
                     break;
                 }
             }
             if (!is_loc) {
                 int val = *(int *)w->sym_entry[Val];
-                printf(" %s=%s ", w->name, fmt_val(val, w->sym_entry[Type]));
+                PRINT_WATCH_VAL(w, val, w->sym_entry[Type]);
             }
         } else {
             printf(" %s=?", w->name);
@@ -512,21 +530,49 @@ void print_escaped(const char *s, int32_t len)
 void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
 {
     char buf[256];
+    char qbuf[32][256]; // command queue for comma-separated input
+    int  qhead = 0, qtail = 0;
     int handled = 0;
 
     while (!handled) {
-        printf("(deb) > ");
-        fflush(stdout);
-        if (!fgets(buf, sizeof(buf), stdin)) {
-            // EOF
-            deb_stepping = 0;
-            trace = 0;
-            handled = 1;
-            break;
+        if (qhead < qtail) {
+            // pop next queued sub-command
+            strncpy(buf, qbuf[qhead % 32], 255); buf[255] = 0;
+            qhead++;
+        } else {
+            printf("(deb) > ");
+            fflush(stdout);
+            if (!fgets(buf, sizeof(buf), stdin)) {
+                // EOF
+                deb_stepping = 0;
+                trace = 0;
+                handled = 1;
+                break;
+            }
+            // trim newline
+            int blen = strlen(buf);
+            if (blen > 0 && buf[blen-1] == '\n') buf[--blen] = 0;
+
+            // split by ',' into queue; first token stays in buf
+            char *rest = buf;
+            char *comma = strchr(rest, ',');
+            if (comma) {
+                *comma = 0;
+                rest = comma + 1;
+                while (rest && *rest && qtail - qhead < 32) {
+                    while (*rest == ' ') rest++;          // trim leading space
+                    char *nc = strchr(rest, ',');
+                    if (nc) *nc = 0;
+                    strncpy(qbuf[qtail % 32], rest, 255);
+                    qbuf[qtail % 32][255] = 0;
+                    qtail++;
+                    rest = nc ? nc + 1 : NULL;
+                }
+            }
+            // trim trailing spaces from first token (buf)
+            blen = strlen(buf);
+            while (blen > 0 && buf[blen-1] == ' ') buf[--blen] = 0;
         }
-        // trim newline
-        int blen = strlen(buf);
-        if (blen > 0 && buf[blen-1] == '\n') buf[--blen] = 0;
 
         if (buf[0] == 0 || (buf[0] == 's' && buf[1] == 0)) {
             // step
@@ -622,9 +668,22 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
             char *wname = buf + 2;
             if (watch_cnt >= MAX_WATCHES) { printf("  Watch table full\n"); }
             else {
+                // Parse optional [n] index: "name[n]" -> base name + index
+                char base_name[64];
+                int  w_is_indexed = 0, w_index = 0;
+                char *bracket = strchr(wname, '[');
+                if (bracket) {
+                    int blen = (int)(bracket - wname);
+                    if (blen > 63) blen = 63;
+                    memcpy(base_name, wname, blen); base_name[blen] = 0;
+                    w_index = atoi(bracket + 1);
+                    w_is_indexed = 1;
+                    wname = base_name;
+                }
                 Watch *w = &watchlist[watch_cnt];
                 strncpy(w->name, wname, 63); w->name[63] = 0;
                 w->sym_entry = NULL; w->is_local = 0; w->fn_entry_pc = 0;
+                w->is_indexed = w_is_indexed; w->index = w_index;
                 // Priority: current-scope local > global > cross-function local
                 int *fn_pc = fntab_lookup_pc(pc - 1);
                 int fn_entry = fn_pc ? (int)fn_pc : 0;
@@ -682,8 +741,12 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
         else if (buf[0] == 'w' && buf[1] == 'l' && buf[2] == 0) {
             int i;
             printf("  Watches:\n");
-            for (i = 0; i < watch_cnt; i++)
-                printf("    [%lld] %s\n", (int)i, watchlist[i].name);
+            for (i = 0; i < watch_cnt; i++) {
+                if (watchlist[i].is_indexed)
+                    printf("    [%lld] %s[%lld]\n", (int)i, watchlist[i].name, (int64_t)watchlist[i].index);
+                else
+                    printf("    [%lld] %s\n", (int)i, watchlist[i].name);
+            }
         }
         else if (buf[0] == 'p' && buf[1] == ' ') {
             char *pname = buf + 2;
@@ -875,7 +938,7 @@ void debug_prompt(int *pc, int *sp, int *bp, int a, int cur_ins, int cycle)
             printf("  Commands: s/Enter=step  n=step-over  c=continue\n");
             printf("            n <func>=break after func() returns  nfl=list  nfd N=delete\n");
             printf("            b N=break  bd N=del-break  bl=list-breaks\n");
-            printf("            w name=watch  wd N=del-watch  wl=list-watches\n");
+            printf("            w name=watch  w name[n]=watch*(name+n)  wd N=del-watch  wl=list-watches\n");
             printf("            p name=print  r=registers  src [N]=source  q=quit\n");
             printf("            i nnn=inspect address (sym/code/data/stack/src-line)\n");
         }
