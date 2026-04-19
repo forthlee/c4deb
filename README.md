@@ -38,8 +38,23 @@ When running with `-t`, execution pauses at each new source line and shows a `(d
 |---------|-------------|
 | `s` or Enter | Step — execute one VM instruction (steps into function calls) |
 | `n` | Step over — run until the current call depth returns |
+| `n <func>` | Function breakpoint — continue and pause when `func()` returns |
+| `nfl` | List all function breakpoints with their indices |
+| `nfd N` | Delete function breakpoint at index N |
 | `c` | Continue — run until the next breakpoint |
 | `q` | Quit |
+
+```
+(deb) > n foo
+  Function breakpoint 0 set on foo()
+(deb) > nfl
+  Function breakpoints:
+    [0] foo()
+(deb) > nfd 0
+  Function breakpoint 0 deleted
+```
+
+`n <func>` is useful when you want to skip over a function entirely and inspect state immediately after it returns — at that point `a` holds the return value and any local variables in the caller still reflect their pre-call state.
 
 ### Breakpoints
 
@@ -235,6 +250,64 @@ Every time execution pauses (step, step-over, or breakpoint), c4deb prints:
 | Bitwise | `OR` `XOR` `AND` `SHL` `SHR` |
 | Comparison | `EQ` `NE` `LT` `GT` `LE` `GE` |
 | System calls | `OPEN` `READ` `CLOS` `PRTF` `MALC` `FREE` `MSET` `MCMP` `EXIT` |
+
+## Example: debugging c4 interpreting hello.c
+
+c4deb can debug the c4 compiler/interpreter itself while it processes another file.
+This two-level session shows how to watch a `char*` variable (`pp`) that points into
+a heap buffer allocated by the interpreted program — something that requires c4deb to
+track `malloc` regions at runtime.
+
+```sh
+./c4deb -t c4.c hello.c
+```
+
+`hello.c`:
+```c
+#include <stdio.h>
+
+int main()
+{
+  printf("hello, world\n");
+  return 0;
+}
+```
+
+At the first pause (c4's `main()` entry), set a watch on `pp` and a function breakpoint
+on `next` (c4's lexer), then continue:
+
+```
+=== [cycle=1] line=333 in main() ===
+  333:  int main(int argc, char **argv)
+   OP: ENT  12
+  ...
+(deb) > w pp
+  Watch added pp
+(deb) > n next
+  Function breakpoint 0 set on next()
+(deb) > c
+  [Function breakpoint: will pause after next() returns]
+
+=== [cycle=436] line=83 in next() ===
+  83:        return;
+   OP: LEV
+  REG: a=133  sp=...  bp=...  pc=...
+  STK: ...
+  WCH: pp="char else enum if int return sizeof while open read close printf"
+(deb) >
+```
+
+What you see at the pause:
+
+| Item | Meaning |
+|------|---------|
+| `line=83 in next()` | Paused at the `return` inside c4's `next()` — the first token has just been recognised |
+| `OP: LEV` | The function is about to return; `a` holds the return value |
+| `a=133` | Token id `133` = `Char` keyword (first keyword in c4's keyword string) |
+| `WCH: pp="char else enum ..."` | `pp` is a `char*` local that points into the heap buffer where c4 loaded hello.c's keyword bootstrap string; c4deb displays it as a string because it tracks heap allocations made via `MALC` |
+
+From here you can press `c` again to pause after the next call to `next()`, step through
+c4's lexer one token at a time, or set a line breakpoint inside c4.c with `b N`.
 
 ## Based on
 
