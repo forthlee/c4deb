@@ -1261,11 +1261,9 @@ int32_t main(int32_t argc, char **argv)
   memset(data, 0, poolsz);
 
   p = "char else enum if int return sizeof while "
-      "open read close printf malloc free memset memcmp exit int32_t int64_t void main";
+      "open read close printf malloc free memset memcmp exit void main";
   i = Char; while (i <= While) { next(); id[Tk] = i++; }
   i = OPEN; while (i <= EXIT) { next(); id[Class] = Sys; id[Type] = INT; id[Val] = i++; }
-  next(); id[Tk] = Int;  // handle int32_t type
-  next(); id[Tk] = Int;  // handle int64_t type
   next(); id[Tk] = Char; // handle void type
   next(); idmain = id;   // keep track of main
 
